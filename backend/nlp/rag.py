@@ -2,94 +2,184 @@ from typing import List, Dict, Any
 import os
 import json
 import logging
+import re
+
+# Import the new required libraries for Llama 3 and LangChain
+from groq import Groq
+from langchain_groq import ChatGroq
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from dotenv import load_dotenv
+
+# Load environment variables from a .env file
+load_dotenv()
+
+# --- Initial setup for the LLM ---
+logger = logging.getLogger(__name__)
+
+
+# --- Global LLM and embedding model variables ---
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+groq_client = None
+embedding_model = None
+
+def load_llm_and_models():
+    """
+    Loads the LLM and embedding model into global variables. Call this at app startup.
+    """
+    global groq_client, embedding_model
+    if not GROQ_API_KEY:
+        raise ValueError("GROQ_API_KEY not found in environment variables. Please set it.")
+    if groq_client is None:
+        groq_client = ChatGroq(
+            model="llama-3.1-8b-instant", 
+            api_key=GROQ_API_KEY,
+            temperature=0.0
+        )
+    if embedding_model is None:
+        from backend.nlp.model_loader import load_nlp_model, get_embedding_model
+        load_nlp_model(os.environ.get("NLP_MODEL_NAME", "paraphrase-multilingual-MiniLM-L12-v2"))
+        embedding_model = get_embedding_model()
+
+# --- Your existing backend functions (no changes here) ---
+# NOTE: These functions must be correctly implemented in your project.
 from backend.nlp.similarity import get_embedding, cosine_similarity
 from backend.db.mongo_utils import get_legal_db 
 
+# --- New main function to orchestrate retrieval and generation ---
+def generate_answer_with_rag(query: str, top_k: int = 5) -> str:
+    """
+    Orchestrates the RAG process: retrieves documents and then generates an answer using Llama 3.
+    """
+    try:
+        # Step 1: Document Retrieval
+        relevant_chunks = retrieve_relevant_faqs(query, top_k=top_k)
+
+        if not relevant_chunks:
+            logger.error("No relevant answer found for query: %s", query)
+            return "Sorry, I couldn't find any relevant information to answer your question."
+
+        # Step 2: Context Formatting
+        context = format_context_for_generation(relevant_chunks)
+
+        prompt_template = """
+        You are a highly knowledgeable AI legal assistant specializing in Indian labour laws.
+        Your task is to provide accurate and concise answers based ONLY on the following context.
+        If the context does not contain enough information to answer the question, state that you cannot answer the question based on the provided information.
+        Do not make up any information.
+        Your task:
+        - Answer the user's question in a clear, step-by-step, and detailed manner.
+        - Use only the information in the CONTEXT below.
+        - Do not make up information. If the answer is not present, say so.
+        - At the end, provide a 'Reference Links' section listing each link only once, even if referenced multiple times.
+        - Do not repeat the same link as a different source number.
+        - Each source entry in the list should be in the format `[Source]: <unique_link_from_context>`.
+
+        Context:
+        {context}
+
+        Question: {question}
+
+        Answer:
+
+        """
+
+        prompt = ChatPromptTemplate.from_template(prompt_template)
+
+        # Use LangChain to create a simple pipeline for RAG
+        rag_chain = (
+            {"context": lambda x: context, "question": lambda x: x["question"]}
+            | prompt
+            | groq_client
+            | StrOutputParser()
+        )
+
+        try:
+            answer = rag_chain.invoke({"question": query})
+        except Exception as llm_error:
+            logger.error(f"LLM API call failed: {llm_error}", exc_info=True)
+            if not GROQ_API_KEY:
+                return "LLM API key is missing. Please set GROQ_API_KEY in your environment."
+            return f"An error occurred while calling the LLM API: {llm_error}"
+
+        # --- Post-process: Only include links for sources actually cited in the answer ---
+        import re
+        # Build a mapping from Source number to link
+        from backend.utils.reference_links import get_collection_reference_link
+        context_chunks = []
+        seen_links = set()
+        for chunk in relevant_chunks:
+            ref_link = ''
+            if '_collection' in chunk:
+                ref_link = get_collection_reference_link(chunk['_collection'])
+            if not ref_link:
+                ref_link = 'Not Available'
+            if ref_link not in seen_links:
+                seen_links.add(ref_link)
+                context_chunks.append(ref_link)
+        # Find all [Source X] cited in the answer
+        cited = set(int(m) for m in re.findall(r'\[Source (\d+)\]', answer))
+        # Build the reference section with only cited links
+        ref_lines = []
+        for idx, link in enumerate(context_chunks, 1):
+            if idx in cited:
+                ref_lines.append(f"[Source {idx}]: {link}")
+        # Remove any existing Reference Links section from the answer
+        answer = re.sub(r'Reference Links:.*', '', answer, flags=re.DOTALL)
+        # Append the filtered Reference Links section
+        if ref_lines:
+            answer = answer.rstrip() + "\n\nReference Links:\n" + "\n".join(ref_lines)
+        return answer
+
+    except Exception as e:
+        logger.error(f"Error in generate_answer_with_rag: {e}", exc_info=True)
+        return f"An error occurred while trying to generate an answer. Details: {e}"
+
+# --- Your original retrieval function (modified and simplified) ---
+# NOTE: The complex keyword filtering and score combining logic has been removed.
+# A pure semantic search is more robust and aligns better with LLM generation.
 def retrieve_relevant_faqs(query: str, top_k: int = 3) -> List[Dict[str, Any]]:
-    """
-    Retrieves the most relevant documents from all content collections in MongoDB.
-    """
     logger = logging.getLogger(__name__)
     try:
         db = get_legal_db() 
-        
-        # 1. Get all collection names and filter out system/non-content collections.
+        # 1. Get all content collection names.
         all_db_collections = db.list_collection_names()
-        
-        # Define all system and utility collections to exclude
         exclude_collections = {
             'logs', 'users', 'admin_marking', 'admin_answers', 'keywords',
             'fs.files', 'fs.chunks', 'admin_users', 'system.views',
             'system.version', 'system.profile'
         }
-        
-        # Identify relevant collections based on query content
-        query_lower = query.lower()
-        query_terms = set(query_lower.split())
-        
-        def get_collection_relevance(collection_name: str) -> float:
-            name_lower = collection_name.lower()
-            # Split on both underscores and spaces for better matching
-            name_terms = set(name_lower.replace('_', ' ').split())
-            # Calculate term overlap between query and collection name
-            matching_terms = query_terms.intersection(name_terms)
-            return len(matching_terms) / len(query_terms) if query_terms else 0
-        
-        # Filter content collections
         content_collections = [
             name for name in all_db_collections 
-            if (not name.startswith('system.') 
-                and not name.startswith('_') 
-                and name not in exclude_collections)
+            if not name.startswith('system.') and not name.startswith('_') and name not in exclude_collections
         ]
-        
-        # Sort collections by relevance to query
-        content_collections.sort(key=get_collection_relevance, reverse=True)
-        
-        logger.debug(f"All collections in DB: {all_db_collections}")
-        logger.debug(f"Excluded collections: {exclude_collections}")
-        logger.info(f"Content collections found (sorted by relevance): {content_collections}")
-        
         if not content_collections:
             logger.warning("No content collections found in the database to search.")
             return []
-
-        logger.info("Searching in collections: %s", ", ".join(content_collections))
-
-        # 2. Fetch all chunks from all content collections.
+        # 2. Fetch all chunks.
         all_chunks = []
         for collection_name in content_collections:
             collection = db[collection_name]
             chunks = list(collection.find({}, {"_id": 1, "content_en": 1, "content_hi": 1, "embedding_en": 1, "embedding_hi": 1, "source": 1}))
             for chunk in chunks:
-                chunk["_collection"] = collection_name  # Tag chunk with its source collection
+                chunk["_collection"] = collection_name
             all_chunks.extend(chunks)
-        
         if not all_chunks:
             logger.warning("No documents (chunks) found in any of the content collections.")
             return []
-
-        # 3. Determine query language and select appropriate embedding field.
-        import re
+        # 3. Determine query language and get embedding.
         is_hindi = re.search(r"[\u0900-\u097F]", query)
         emb_field = "embedding_hi" if is_hindi else "embedding_en"
         content_field = "content_hi" if is_hindi else "content_en"
-        logger.info(f"Query language detected as {'Hindi' if is_hindi else 'English'}. Using '{emb_field}'.")
-
-        # 4. Get embedding for the user's query.
         query_emb = get_embedding(query)
-
-        # 5. Score each chunk based on cosine similarity.
+        # 4. Score each chunk based on cosine similarity.
         scored_chunks = []
         for chunk in all_chunks:
             chunk_emb = chunk.get(emb_field)
-            
-            # If embedding is missing, generate and store it on-the-fly.
             if not chunk_emb:
                 content = chunk.get(content_field) or chunk.get("content_en") or ""
                 if content:
                     try:
-                        logger.warning(f"Embedding missing for chunk from '{chunk.get('source')}'. Generating on-the-fly.")
                         chunk_emb = get_embedding(content)
                         db[chunk["_collection"]].update_one(
                             {"_id": chunk["_id"]},
@@ -100,156 +190,59 @@ def retrieve_relevant_faqs(query: str, top_k: int = 3) -> List[Dict[str, Any]]:
                         continue
                 else:
                     continue
-
             try:
                 sim = cosine_similarity(query_emb, chunk_emb)
                 scored_chunks.append((sim, chunk))
             except Exception as e:
                 logger.warning(f"Could not calculate similarity for chunk {chunk.get('_id')}: {e}")
-
         if not scored_chunks:
             logger.info("No chunks were scored successfully.")
             return []
-
-        # 6. Sort chunks by combined score (similarity and collection relevance)
-        for sim, chunk in scored_chunks:
-            # Combine semantic similarity with collection relevance
-            combined_score = (sim * 0.7) + (chunk.get("_collection_relevance", 0) * 0.3)
-            chunk["_combined_score"] = combined_score
-        
-        # Sort by combined score
-        scored_chunks.sort(reverse=True, key=lambda x: x[1].get("_combined_score", x[0]))
-        
+        # 5. Sort by semantic similarity and return top results.
+        scored_chunks.sort(reverse=True, key=lambda x: x[0])
         top_results = []
         for sim, chunk in scored_chunks[:top_k]:
             result = {
-                "score": chunk.get("_combined_score", sim),
-                "semantic_score": sim,
-                "collection_relevance": chunk.get("_collection_relevance", 0),
+                "score": sim,
                 "source": chunk.get("source"),
                 "content_en": chunk.get("content_en"),
                 "content_hi": chunk.get("content_hi"),
                 "_collection": chunk.get("_collection")
             }
             top_results.append(result)
-
-        logger.info("Top %d matches: %s", len(top_results), 
-                   "; ".join(f"Score: {res['score']:.3f} (Sem: {res['semantic_score']:.3f}, Rel: {res['collection_relevance']:.3f}) -> {res['source']}" 
-                            for res in top_results))
-        
-        # --- Strong phrase/keyword match for legal action ---
-        query_lower = query.lower()
-
-        # --- Stricter phrase/section match ---
-        import re
-        # Extract all section numbers from the query
-        section_numbers = re.findall(r'section\s*\d+[a-zA-Z()]*', query_lower)
-        # Extract main legal action words (e.g., 'service separation', 'closure', etc.)
-        legal_phrases = [
-            # Employment/Separation
-            'service separation', 'separation', 'termination', 'dismissal', 'removal', 'resignation',
-            'retirement', 'superannuation', 'voluntary retirement', 'compulsory retirement',
-            # Dispute/Claim Types
-            'closure', 'retrenchment', 'layoff', 'wage claim', 'gratuity', 'bonus', 'overtime',
-            'appeal', 'recovery', 'charter of demands', 'standing order', 'maternity', 'journalist',
-            'factory', 'application', 'dispute', 'conciliation', 'prosecution', 'time limit', 'timeline',
-            'non-payment', 'case disposal', 'industrial dispute', 'settlement', 'conciliation', 'adjudication',
-            'award', 'reference', 'reinstatement', 'compensation', 'back wages', 'promotion', 'transfer',
-            'suspension', 'show cause', 'charge sheet', 'enquiry', 'disciplinary', 'punishment',
-            # Applicability/Scope
-            'applicability', 'scope', 'applies to', 'extends to', 'whole of india', 'jurisdiction', 'coverage', 'extent', 'territorial', 'who does this act apply to', 'where does this act apply', 'pan india', 'state of', 'all of india', 'entire country',
-            # Acts/Sections
-            'industrial disputes act', 'minimum wages act', 'payment of wages act', 'equal remuneration act',
-            'maternity benefit act', 'mp industrial relations act', 'working journalists act',
-            'payment of gratuity act', 'beedi and cigar workers act', 'shops and establishments act',
-            'standing orders act', 'factories act', 'labour law', 'labour department',
-            # Misc
-            'case', 'petition', 'application', 'order', 'notice', 'hearing', 'compliance', 'delay',
-            'extension', 'limitation', 'period', 'duration', 'within', 'prescribed', 'specified', 'fixed',
-            'mandate', 'requirement', 'obligation', 'responsibility', 'accountability', 'disciplinary action',
-            'officer', 'employee', 'employer', 'worker', 'staff', 'management', 'union', 'committee',
-            'board', 'tribunal', 'court', 'authority', 'government', 'department', 'ministry',
-            # Hindi/vernacular (for bilingual queries)
-            'सेवा पृथक्करण', 'समाप्ति', 'सेवानिवृत्ति', 'निलंबन', 'छंटनी', 'समझौता', 'मामला', 'आवेदन',
-            'निर्णय', 'अधिनियम', 'धारा', 'समय सीमा', 'समय-सीमा', 'विलंब', 'कार्रवाई', 'शिकायत', 'अपील',
-            'श्रम', 'कर्मचारी', 'नियोक्ता', 'प्रबंधन', 'संघ', 'बोर्ड', 'अधिकार', 'प्राधिकरण', 'सरकार',
-        ]
-        # --- Applicability/Scope post-filter ---
-        applicability_words = ['applicability', 'scope', 'applies to', 'extends to', 'whole of india', 'jurisdiction', 'coverage', 'extent', 'who does this act apply to', 'where does this act apply', 'pan india', 'all of india', 'entire country', 'state of']
-        if any(word in query_lower for word in applicability_words):
-            applicability_chunks = []
-            for sim, chunk in scored_chunks:
-                for field in ["source", "content_en", "content_hi"]:
-                    val = (chunk.get(field) or "").lower()
-                    if any(word in val for word in applicability_words):
-                        applicability_chunks.append((sim + 1.0, chunk))
-                        break
-            if applicability_chunks:
-                applicability_chunks = list({id(c[1]): c for c in applicability_chunks}.values())
-                applicability_chunks.sort(reverse=True, key=lambda x: x[0])
-                return [chunk for sim, chunk in applicability_chunks[:top_k]]
-        matched_phrases = [phrase for phrase in legal_phrases if phrase in query_lower]
-        strong_chunks = []
-        for sim, chunk in scored_chunks:
-            for field in ["source", "content_en", "content_hi"]:
-                val = (chunk.get(field) or "").lower()
-                # Require all matched phrases to be present in the chunk
-                if matched_phrases and all(phrase in val for phrase in matched_phrases):
-                    # If section number is in query, prefer chunk with same section
-                    if section_numbers:
-                        if any(sec in val for sec in section_numbers):
-                            strong_chunks.append((sim + 1.0, chunk))  # boost score for perfect match
-                        else:
-                            continue
-                    else:
-                        strong_chunks.append((sim, chunk))
-        if strong_chunks:
-            strong_chunks = list({id(c[1]): c for c in strong_chunks}.values())
-            strong_chunks.sort(reverse=True, key=lambda x: x[0])
-            return [chunk for sim, chunk in strong_chunks[:top_k]]
-
-        # --- Fallback: Post-filter for section/word match as before ---
-        preferred_chunks = []
-        for sim, chunk in scored_chunks:
-            for field in ["source", "content_en", "content_hi"]:
-                val = (chunk.get(field) or "").lower()
-                import re
-                section_match = re.search(r'section\s*\d+[a-zA-Z()]*', query_lower)
-                if section_match and section_match.group(0) in val:
-                    preferred_chunks.append((sim, chunk))
-                    break
-                for word in query_lower.split():
-                    if len(word) > 3 and word in val:
-                        preferred_chunks.append((sim, chunk))
-                        break
-        if preferred_chunks:
-            preferred_chunks = list({id(c[1]): c for c in preferred_chunks}.values())
-            preferred_chunks.sort(reverse=True, key=lambda x: x[0])
-            return [chunk for sim, chunk in preferred_chunks[:top_k]]
-        # Otherwise, return the full chunk data for the top results, sorted by combined score
-        return [chunk for sim, chunk in scored_chunks[:top_k]]
+        logger.info(f"Top {len(top_results)} matches retrieved.")
+        return top_results
     except Exception as e:
         logger.error(f"Error in retrieve_relevant_faqs: {e}", exc_info=True)
         return []
 
-def format_context_for_generation(faqs: List[Dict[str, Any]], language: str = 'en') -> str:
+# --- Your original formatting function (modified for simplicity) ---
+# NOTE: Removed the unused `language` parameter to simplify.
+def format_context_for_generation(faqs: List[Dict[str, Any]]) -> str:
+    """
+    Formats the retrieved chunks into a string for the LLM, including reference links for each chunk.
+    """
+    from backend.utils.reference_links import get_collection_reference_link
+    # Deduplicate by reference link
+    seen_links = set()
+    unique_chunks = []
+    for chunk in faqs:
+        ref_link = ''
+        if '_collection' in chunk:
+            ref_link = get_collection_reference_link(chunk['_collection'])
+        if not ref_link:
+            ref_link = 'Not Available'
+        if ref_link not in seen_links:
+            seen_links.add(ref_link)
+            chunk['__ref_link'] = ref_link
+            unique_chunks.append(chunk)
     lines = []
-    for i, chunk in enumerate(faqs, 1):
-        # Try to get content in the requested language, fallback to other language if needed
-        text = (
-            chunk.get(f'content_{language}') or
-            chunk.get('content_en' if language == 'hi' else 'content_hi') or
-            chunk.get('content') or
-            chunk.get('text') or
-            chunk.get('source', '') or
-            str(chunk)
-        ).strip()
-        
-        # Try to get topic from collection name if not in chunk
+    for i, chunk in enumerate(unique_chunks, 1):
+        text = chunk.get('content_en', chunk.get('content_hi', ''))
         topic = chunk.get('topic', '')
         if not topic and '_collection' in chunk:
             topic = chunk['_collection'].replace('_', ' ').title()
-        
-        lines.append(f"Chunk {i} (Topic: {topic}):\n{text}\n")
-    
+        ref_link = chunk.get('__ref_link', 'Not Available')
+        ref_str = f"Reference Link: {ref_link}"
+        lines.append(f"Source {i} (Topic: {topic}):\n{text}\n{ref_str}\n")
     return "\n".join(lines)
