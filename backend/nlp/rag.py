@@ -68,12 +68,12 @@ def generate_answer_with_rag(query: str, top_k: int = 5) -> str:
         If the context does not contain enough information to answer the question, state that you cannot answer the question based on the provided information.
         Do not make up any information.
         Your task:
-        - Answer the user's question in a clear, step-by-step, and detailed manner.
+        - Answer the user's question in a clear non repetative, step-by-step, and detailed manner.
         - Use only the information in the CONTEXT below.
         - Do not make up information. If the answer is not present, say so.
         - At the end, provide a 'Reference Links' section listing each link only once, even if referenced multiple times.
-        - Do not repeat the same link as a different source number.
         - Each source entry in the list should be in the format `[Source]: <unique_link_from_context>`.
+        - Do not repeat the same link as a different source number.
 
         Context:
         {context}
