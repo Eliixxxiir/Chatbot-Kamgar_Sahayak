@@ -9,3 +9,5 @@ passlib[bcrypt]
 PyJWT
 email-validator
 gTTs
+groq 
+langchain-groq
